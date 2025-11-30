@@ -10,9 +10,20 @@ OUT = Path("./reports"); OUT.mkdir(parents=True, exist_ok=True)
 def r2_rmse_panels():
     df = pd.read_csv(RES/"summary.csv")
     fig = plt.figure(figsize=(10,4))
-    plt.subplot(1,2,1); df["r2_oos"].hist(bins=40); plt.title("OOS R²")
-    plt.subplot(1,2,2); q99=df["rmse_oos"].quantile(0.99); df.loc[df["rmse_oos"]<=q99,"rmse_oos"].hist(bins=40); plt.title("RMSE (<=99%)")
-    plt.tight_layout(); plt.savefig(OUT/"dist_r2_rmse.png"); plt.close()
+    # 用 in-sample 指标
+    plt.subplot(1,2,1)
+    df["r2_in"].hist(bins=40)
+    plt.title("In-sample R²")
+
+    plt.subplot(1,2,2)
+    q99 = df["rmse_in"].quantile(0.99)
+    df.loc[df["rmse_in"] <= q99, "rmse_in"].hist(bins=40)
+    plt.title("RMSE (<=99%, in-sample)")
+
+    plt.tight_layout()
+    plt.savefig(OUT/"dist_r2_rmse.png")
+    plt.close()
+
 
 def top_pairs_bar(n=20):
     from collections import Counter
@@ -43,7 +54,8 @@ def main():
     r2_rmse_panels()
     top_pairs_bar()
     # 也给 R² 前 10 的用户各画一张
-    df = pd.read_csv(RES/"summary.csv").sort_values("r2_oos", ascending=False).head(10)
+    df = pd.read_csv(RES/"summary.csv").sort_values("r2_in", ascending=False).head(10)
+
     for uid in df["user_id"]:
         per_user_report(uid)
     print(f"done. see {OUT}")

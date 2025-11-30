@@ -26,6 +26,7 @@ N_SPLITS         = 5       # TimeSeriesSplit 折数（>=3）
 ROLLING_WINDOW   = None    # 如设为 90，滚动训练 90 天、前瞻预测；None 则一次性拟合
 OUT_DIR          = "./data/results"
 os.makedirs(OUT_DIR, exist_ok=True)
+LASSO_ALPHA     = 1e-5
 # ==============================================
 # ---- 模型与调参网格 ----
 USE_ELASTICNET = True          # 用 ElasticNet（更抗共线）
@@ -87,8 +88,8 @@ def load_features():
 
 def load_user_pnl(csv_path=USER_PNL_CSV):
     import pandas as pd, numpy as np
-    # 你的列：id, timestamp, pnl(累计), margin(可选)
-    use_cols = ["id", "timestamp", "pnl"]  # margin 暂时不用
+    # 列：id, timestamp, pnl(累计), margin(可选)
+    use_cols = ["id", "timestamp", "pnl"]
     df = pd.read_csv(csv_path, usecols=use_cols).sort_values(["id", "timestamp"]).copy()
 
     # timestamp -> int64 (UTC 秒)
@@ -96,27 +97,30 @@ def load_user_pnl(csv_path=USER_PNL_CSV):
     df = df.dropna(subset=["timestamp"])
     df["timestamp"] = df["timestamp"].astype(np.int64)
 
-    # 累计 -> 逐期：按用户分组差分；第一条用原值（等价于从0起算）
+    # 累计 -> 逐期：按用户分组差分；第一条用原值（等价于从 0 起算）
     df["pnl_period"] = df.groupby("id")["pnl"].diff().fillna(df["pnl"])
 
-    # 轻度 winsorize 防极端（可按需调整/关闭）
-    q1, q99 = df["pnl_period"].quantile([0.01, 0.99])
-    df["pnl_w"] = df["pnl_period"].clip(q1, q99)
-
-    # 与后续代码约定的列名对齐：user_id, timestamp, pnl_w
+    # 不再 winsorize，直接用 pnl_period
     df = df.rename(columns={"id": "user_id"})
-    return df[["user_id", "timestamp", "pnl_w"]]
+    return df[["user_id", "timestamp", "pnl_period"]]
+
 
 def build_Xy_for_user(feat, pnl_user):
-    # 对齐到用户时间段；外连接再在 y 上筛
-    df = pd.merge(pnl_user[["timestamp","pnl_w"]], feat, on="timestamp", how="left")
-    # 去掉特征全空的行
+    # 用 pnl_period 对齐特征
+    df = pd.merge(pnl_user[["timestamp", "pnl_period"]], feat, on="timestamp", how="left")
+
     Xcols = [c for c in df.columns if c.endswith("_ret") or c.endswith("_funding_sum")]
     df = df.dropna(subset=Xcols, how="all")
-    # 进一步：若任意特征 NaN，先用列均值填充或直接剔除该行（保守起见，这里剔除）
     df = df.dropna(subset=Xcols, how="any")
+
+    # 如果你还想过滤“增量=0”的点，就保留这一行；不想过滤就删掉
+    df = df[df["pnl_period"] != 0]
+
+    if df.empty:
+        return np.empty((0, len(Xcols))), np.array([]), np.array([]), Xcols
+
     X = df[Xcols].values
-    y = df["pnl_w"].values
+    y = df["pnl_period"].values
     t = df["timestamp"].values
     return X, y, t, Xcols
 
@@ -168,7 +172,7 @@ def run_for_user(user_id, feat, pnl):
         return None
 
     X, y, ts, Xcols = build_Xy_for_user(feat, pnl_u)
-    if len(y) < 100:
+    if len(y) < 6:
         print(f"[WARN] user {user_id}: too few samples ({len(y)}).")
         return None
 
@@ -185,49 +189,58 @@ def run_for_user(user_id, feat, pnl):
         df_pred = pd.DataFrame(results, columns=["timestamp","y_true","y_pred"])
         df_pred.to_csv(os.path.join(OUT_DIR, f"pred_{user_id}.csv"), index=False)
         return {"user_id": user_id, "rolling_points": len(df_pred)}
+    
     else:
-        # === 训练完成后（model 是 GridSearchCV 返回的） ===
-        splits = time_series_split_idx(len(y), n_splits=N_SPLITS)
-        model  = fit_lasso_time_series(X, y, ALPHA_GRID, N_SPLITS)
-        metrics = evaluate_oos(model, X, y, splits)
+        # ====== 简单版：全样本 Lasso（只有 L1 惩罚，不做 TimeSeriesSplit / CV） ======
+        from sklearn.preprocessing import StandardScaler
+        from sklearn.linear_model import Lasso
+        from sklearn.metrics import r2_score, mean_squared_error
 
-        # ====== 从最优管线中取出 scaler 与 lasso ======
-        best_pipe = model.best_estimator_                  # Pipeline(scaler -> lasso)
-        scaler    = best_pipe.named_steps["scaler"]        # StandardScaler
-        lasso     = best_pipe.named_steps["ls"]            # Lasso
+        # 1) 标准化特征
+        scaler = StandardScaler(with_mean=True, with_std=True)
+        X_std = scaler.fit_transform(X)
 
-        # ---- 1) 标准化空间下的系数（与模型拟合时一致） ----
+        # 2) 直接在全样本上拟合 Lasso（只有 L1，没有 L2）
+        lasso = Lasso(alpha=LASSO_ALPHA, max_iter=200000, tol=1e-3)
+        lasso.fit(X_std, y)
+
+        # 3) 做一个简单的 in-sample 评价（只是看看拟合程度，不是严格 OOS）
+        y_pred = lasso.predict(X_std)
+        r2_in  = r2_score(y, y_pred)
+        rmse_in = np.sqrt(mean_squared_error(y, y_pred))
+
+        # 4) 从标准化空间还原到原始量纲
         beta_std = lasso.coef_.copy()
         b0_std   = lasso.intercept_
 
-        # ---- 2) 还原到“原始量纲”的系数（可选，更易解读） ----
-        #   X_raw -> 标准化:  X_std = (X_raw - mean_) / scale_
-        #   y 未标准化，因此 beta_raw = beta_std / scale_
-        #   截距还原: b0_raw = b0_std - sum( mean_/scale_ * beta_std )
-        import numpy as np
         scale = np.asarray(scaler.scale_, dtype=float)
         mean  = np.asarray(scaler.mean_,  dtype=float)
-
-        # 避免除以 0（极少数常量列）
         safe_scale = np.where(scale == 0.0, 1.0, scale)
 
         beta_raw = beta_std / safe_scale
         b0_raw   = b0_std - np.sum((mean / safe_scale) * beta_std)
 
-        # ====== 组装并导出 ======
-        import pandas as pd
+        # 5) 组装并导出系数
         df_coef = pd.DataFrame({
             "feature":  Xcols,
-            "coef_std": beta_std,           # 标准化空间的系数（用于稀疏选择/比较相对重要性）
-            "coef_raw": beta_raw,           # 原始量纲的系数（用于可解释性/与PnL量纲关联）
-            "abs_coef": np.abs(beta_std)    # 习惯上用标准化系数做“强度排序”
+            "coef_std": beta_std,
+            "coef_raw": beta_raw,
+            "abs_coef": np.abs(beta_std)
         }).sort_values("abs_coef", ascending=False)
 
         df_coef.to_csv(os.path.join(OUT_DIR, f"coef_{user_id}.csv"), index=False)
-        with open(os.path.join(OUT_DIR, f"metrics_{user_id}.txt"), "w") as f:
-            f.write(str({**metrics, "best_alpha": model.best_params_.get("ls__alpha", None)}))
 
-        # Top-N 非零（用标准化系数判断稀疏性更稳）
+        # 6) 保存简单的训练集指标
+        metrics = {
+            "r2_in":  float(r2_in),
+            "rmse_in": float(rmse_in),
+            "n_obs": int(len(y)),
+            "alpha": float(LASSO_ALPHA)
+        }
+        with open(os.path.join(OUT_DIR, f"metrics_{user_id}.txt"), "w") as f:
+            f.write(str(metrics))
+
+        # Top-N 非零特征
         top_nonzero = df_coef[df_coef["abs_coef"] > 1e-8].head(10)["feature"].tolist()
 
         return {
@@ -236,6 +249,7 @@ def run_for_user(user_id, feat, pnl):
             **metrics
         }
 
+
 def main():
     # 1) 载入特征 & 用户逐期 pnl
     feat = load_features()
@@ -243,8 +257,8 @@ def main():
 
     # 2) 先做“用户层清洗”：样本数 & 方差
     stats = pnl.groupby("user_id").agg(
-        n=("pnl_w","size"),
-        v=("pnl_w","var")
+        n=("pnl_period","size"),
+        v=("pnl_period","var")
     ).reset_index()
     eligible = stats[(stats["n"] >= MIN_OBS) & (stats["v"].fillna(0) >= VAR_EPS)]["user_id"].tolist()
 
